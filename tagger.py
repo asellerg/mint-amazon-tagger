@@ -14,19 +14,17 @@ from collections import defaultdict, Counter
 import copy
 import csv
 import datetime
+import json
 import logging
 import pickle
+import random
 import string
 import time
 import sys
 
 import getpass
 import keyring
-# Temporary until mintapi is fixed upstream.
-import mint_api as mintapi
-from mint_api import MINT_ROOT_URL
-# import mintapi
-# from mintapi.api import MINT_ROOT_URL
+from seleniumrequests import Chrome
 
 import category
 
@@ -117,12 +115,12 @@ def parse_amazon_date(date_str):
         return datetime.datetime.strptime(date_str, '%m/%d/%y').date()
 
 
-def parse_mint_date(dateraw):
-    cy = datetime.datetime.isocalendar(datetime.date.today())[0]
+def parse_mint_date(json_date_field):
+    current_year = datetime.datetime.isocalendar(datetime.date.today())[0]
     try:
-        newdate = datetime.datetime.strptime(dateraw + str(cy), '%b %d%Y')
+        newdate = datetime.datetime.strptime(json_date_field + str(current_year), '%b %d%Y')
     except:
-        newdate = datetime.datetime.strptime(dateraw, '%m/%d/%y')
+        newdate = datetime.datetime.strptime(json_date_field, '%m/%d/%y')
     return newdate.date()
 
 
@@ -926,7 +924,7 @@ def write_tags_to_mint(orig_trans_to_tagged, mint_client):
     logger.info('Sent {} updates to Mint in {}'.format(num_requests, dur))
 
 
-def get_mint_client(args):
+def get_mint_driver(args):
     email = args.mint_email
     password = args.mint_password
 
@@ -943,40 +941,45 @@ def get_mint_client(args):
         logger.error('Missing Mint email or password.')
         exit(1)
 
-    last_pickled_session_cookies = keyring.get_password(
-        KEYRING_SERVICE_NAME, '{}_session_cookies'.format(email))
-    last_login_time = keyring.get_password(
-        KEYRING_SERVICE_NAME, '{}_last_login'.format(email))
+    driver = Chrome()
 
-    session_cookies = None
+    driver.get("https://www.mint.com")
+    driver.implicitly_wait(10)  # seconds
+    driver.find_element_by_link_text("Log In").click()
 
-    # Reuse the stored session_cookies if this script has run in the last 15
-    # minutes.
-    if (last_pickled_session_cookies and last_login_time and
-            int(time.time()) - int(last_login_time) < 15 * 60):
-        session_cookies = pickle.loads(codecs.decode(last_pickled_session_cookies.encode(), "base64"))
+    driver.find_element_by_id("ius-userid").send_keys(args.mint_email)
+    driver.find_element_by_id("ius-password").send_keys(args.mint_password)
+    driver.find_element_by_id("ius-sign-in-submit-btn").submit()
 
-    # Reusing session_cookies isn't working in Python2. SAD
-    #    if sys.version_info < (3, 0):
-    session_cookies = None
+    while not driver.current_url.startswith('https://mint.intuit.com/overview.event'):
+        time.sleep(1)
 
-    logger.info('Using previous session tokens.'
-                if session_cookies
-                else 'Logging in via chromedriver')
-    mint_client = mintapi.Mint.create(email, password, session_cookies)
+    driver.implicitly_wait(10)
+    driver.find_element_by_id("transaction") # Wait until the overview page has actually loaded.
 
     logger.info('Login successful!')
 
-    # On success, save off password, session tokens, and login time to keyring.
+    # On success, save off password to keyring.
     keyring.set_password(KEYRING_SERVICE_NAME, email, password)
-    keyring.set_password(
-        KEYRING_SERVICE_NAME, '{}_session_cookies'.format(email),
-        codecs.encode(pickle.dumps(mint_client.cookies), "base64").decode())
-    keyring.set_password(
-        KEYRING_SERVICE_NAME, '{}_last_login'.format(email),
-        str(int(time.time())))
 
-    return mint_client
+    return driver
+
+
+token = None
+def get_mint_token
+    global token
+    if token:
+        return token
+    value_json = driver.find_element_by_name('javascript-user').get_attribute('value')
+    token = json.loads(value_json)['token']
+
+    return token
+
+
+def log_out_mint_driver(driver):
+    driver.implicitly_wait(1)
+    driver.find_element_by_link_text("Log Out").click()
+    driver.quit()
 
 
 def parse_amazon_csv(args):
@@ -1162,6 +1165,42 @@ def define_args(parser):
               'tagged by this tool.'))
 
 
+import pprint
+
+def get_transactions_from_mint(driver, start_date=None):
+    try:
+        start_date = datetime.strptime(start_date, '%m/%d/%y')
+    except:
+        start_date = None
+    result = []
+    offset = 0
+    while True:
+        url = 'https://mint.intuit.com/getJsonData.xevent'
+        params = {
+            'queryNew': '',
+            'offset': offset,
+            'comparableType': 8,
+            'rnd': random.randrange(999),
+            'accountId': 0,
+            'acctChanged': 'T',
+            'task': 'transactions,txnfilters',
+            'filterType': 'cash',
+        }
+        response = driver.request('GET', url, params=params)
+        data = json.loads(response.text)
+        trans = data['set'][0].get('data', [])
+        if not trans:
+            break
+        if start_date:
+            last_date = parse_mint_date(trans[-1]['odate'])
+            if last_date < start_date:
+                result.extend([t for t in trans if parse_mint_date(t['odate']) >= start_date])
+                break
+        result.extend(trans)
+        offset += len(trans)
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(
         description='Tag Mint transactions based on itemized Amazon history.')
@@ -1174,19 +1213,20 @@ def main():
     amazon_items, amazon_orders, amazon_refunds = parse_amazon_csv(args)
     log_amazon_stats(amazon_items, amazon_orders, amazon_refunds)
 
-    mint_client = None
+    trans = get_transactions_from_mint(driver)
+
+    pprint.pprint(pythonify_mint_dict(trans))
+
     if args.pickled_epoch:
         mint_transactions, mint_category_name_to_id = (
             get_trans_and_categories_from_pickle(args.pickled_epoch))
-    else:
-        mint_client = get_mint_client(args)
 
         # Only get transactions as new as the oldest Amazon order.
         oldest_trans_date = min(
             min([o['Order Date'] for o in amazon_orders]),
             min([o['Order Date'] for o in amazon_refunds]))
         mint_transactions, mint_category_name_to_id = (
-            get_trans_and_categories_from_mint(mint_client, oldest_trans_date))
+            get_trans_and_categories_from_mint(mint_driver, oldest_trans_date))
         epoch = int(time.time())
         dump_trans_and_categories(
             mint_transactions, mint_category_name_to_id, epoch)
@@ -1216,10 +1256,10 @@ def main():
         print_dry_run(filtered)
     else:
         # Ensure we have a Mint client.
-        if not mint_client:
-            mint_client = get_mint_client(args)
+        if not mint_driver:
+            mint_driver = get_mint_driver(args)
 
-        write_tags_to_mint(filtered, mint_client)
+        write_tags_to_mint(filtered, mint_driver)
 
 
 if __name__ == '__main__':
