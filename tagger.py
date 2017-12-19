@@ -242,14 +242,15 @@ def log_amazon_stats(items, orders, refunds):
         micro_usd_to_usd_string(sum(per_item_totals) / len(items)),
         micro_usd_to_usd_string(max(per_item_totals))))
 
-    first_refund_date = min([r['Refund Date'] for r in refunds if r['Refund Date']])
-    last_refund_date = max([r['Refund Date'] for r in refunds if r['Refund Date']])
-    logger.info('\n{} refunds dating from {} to {}'.format(len(refunds), first_refund_date, last_refund_date))
+    if refunds:
+        first_refund_date = min([r['Refund Date'] for r in refunds if r['Refund Date']])
+        last_refund_date = max([r['Refund Date'] for r in refunds if r['Refund Date']])
+        logger.info('\n{} refunds dating from {} to {}'.format(len(refunds), first_refund_date, last_refund_date))
 
-    per_refund_totals = [r['Total Refund Amount'] for r in refunds]
-
-    logger.info('{} total refunded'.format(
-        micro_usd_to_usd_string(sum(per_refund_totals))))
+        per_refund_totals = [r['Total Refund Amount'] for r in refunds]
+        
+        logger.info('{} total refunded'.format(
+            micro_usd_to_usd_string(sum(per_refund_totals))))
 
 
 def log_processing_stats(stats, prefix):
@@ -947,8 +948,8 @@ def get_mint_driver(args):
     driver.implicitly_wait(10)  # seconds
     driver.find_element_by_link_text("Log In").click()
 
-    driver.find_element_by_id("ius-userid").send_keys(args.mint_email)
-    driver.find_element_by_id("ius-password").send_keys(args.mint_password)
+    driver.find_element_by_id("ius-userid").send_keys(email)
+    driver.find_element_by_id("ius-password").send_keys(password)
     driver.find_element_by_id("ius-sign-in-submit-btn").submit()
 
     while not driver.current_url.startswith('https://mint.intuit.com/overview.event'):
@@ -966,7 +967,7 @@ def get_mint_driver(args):
 
 
 token = None
-def get_mint_token
+def get_mint_token(driver):
     global token
     if token:
         return token
@@ -1031,19 +1032,16 @@ def dump_trans_and_categories(trans, cats, pickle_epoch):
     with open(MINT_CATS_PICKLE_FMT.format(pickle_epoch), 'wb') as f:
         pickle.dump(cats, f)
 
-def get_trans_and_categories_from_mint(mint_client, oldest_trans_date):
+def get_trans_and_categories_from_mint(mint_driver, oldest_trans_date):
     # Create a map of Mint category name to category id.
     logger.info('Creating Mint Category Map.')
     categories = dict([
         (cat_dict['name'], cat_id)
-        for (cat_id, cat_dict) in mint_client.get_categories().items()])
+        for (cat_id, cat_dict) in get_categories_from_mint(mint_driver).items()])
 
-    start_date_str = oldest_trans_date.strftime('%m/%d/%y')
-    logger.info('Fetching all Mint transactions since {}.'.format(start_date_str))
-    transactions = pythonify_mint_dict(mint_client.get_transactions_json(
-        start_date=start_date_str,
-        include_investment=False,
-        skip_duplicates=True))
+    logger.info('Fetching all Mint transactions since {}.'.format(oldest_trans_date))
+    transactions = pythonify_mint_dict(get_transactions_from_mint(
+        mint_driver, oldest_trans_date))
 
     return transactions, categories
 
@@ -1165,13 +1163,43 @@ def define_args(parser):
               'tagged by this tool.'))
 
 
-import pprint
+request_id = 0
 
+    
+def get_categories_from_mint(mint_driver):
+    global request_id
+    request_id += 1
+    this_request_id = str(request_id)
+    data = {
+        'input': json.dumps([{
+            'args': {
+                'excludedCategories': [],
+                'sortByPrecedence': False,
+                'categoryTypeFilter': 'FREE',
+            },
+            'id': this_request_id,
+            'service': 'MintCategoryService',
+            'task': 'getCategoryTreeDto2',
+        }])
+    }
+
+    url = 'https://mint.intuit.com/bundledServiceController.xevent?legacy=false&token={}'.format(
+        get_mint_token(mint_driver))
+    response = mint_driver.request('POST', url, data=data).text
+    if this_request_id not in response:
+        raise MintException('Could not parse category data: "' +
+                            response + '"')
+    response = json.loads(response)
+    response = response['response'][this_request_id]['response']
+
+    categories = {}
+    for category in response['allCategories']:
+        categories[category['id']] = category
+
+    return categories
+
+                      
 def get_transactions_from_mint(driver, start_date=None):
-    try:
-        start_date = datetime.strptime(start_date, '%m/%d/%y')
-    except:
-        start_date = None
     result = []
     offset = 0
     while True:
@@ -1210,21 +1238,26 @@ def main():
     if args.dry_run:
         logger.info('Dry Run; no modifications being sent to Mint.')
 
+    mint_driver = None
+    import atexit
+    def quit_mint_driver():
+        mint_driver and mint_driver.quit()
+    atexit.register(quit_mint_driver)
+
     amazon_items, amazon_orders, amazon_refunds = parse_amazon_csv(args)
     log_amazon_stats(amazon_items, amazon_orders, amazon_refunds)
-
-    trans = get_transactions_from_mint(driver)
-
-    pprint.pprint(pythonify_mint_dict(trans))
 
     if args.pickled_epoch:
         mint_transactions, mint_category_name_to_id = (
             get_trans_and_categories_from_pickle(args.pickled_epoch))
-
+    else:
         # Only get transactions as new as the oldest Amazon order.
-        oldest_trans_date = min(
-            min([o['Order Date'] for o in amazon_orders]),
-            min([o['Order Date'] for o in amazon_refunds]))
+        oldest_trans_date = min([o['Order Date'] for o in amazon_orders])
+        if amazon_refunds:
+            oldest_trans_date = min(
+                oldest_trans_date,
+                min([o['Order Date'] for o in amazon_refunds]))
+        mint_driver = get_mint_driver(args)
         mint_transactions, mint_category_name_to_id = (
             get_trans_and_categories_from_mint(mint_driver, oldest_trans_date))
         epoch = int(time.time())
