@@ -315,9 +315,18 @@ class Order:
 
         # Itemize line-items:
         for i in items:
-            new_cat = (t.category if skip_category
-                       else category.AMAZON_TO_MINT_CATEGORY.get(
-                            i.category, category.DEFAULT_MINT_CATEGORY))
+            if skip_category:
+                new_cat = t.category
+            else:
+                found = False
+                for keyword, cat in category.KEYWORD_TO_MINT_CATEGORY.items():
+                    if keyword.lower() in i.get_title().lower():
+                        new_cat = cat
+                        found = True
+                if not found:
+                    new_cat = category.AMAZON_TO_MINT_CATEGORY.get(
+                        i.category, category.DEFAULT_MINT_CATEGORY)
+
             item = t.split(
                 amount=i.item_total,
                 category=new_cat,
